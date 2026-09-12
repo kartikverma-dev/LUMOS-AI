@@ -152,18 +152,37 @@ fun SettingsScreen(repo: SettingsRepository, onBack: () -> Unit) {
                 Column(Modifier.padding(12.dp)) {
                     Text("Start the server (Termux)", style = MaterialTheme.typography.titleSmall)
                     Spacer(Modifier.height(4.dp))
+                    val command = remember(settings) { buildTermuxCommand(settings) }
                     Text(
-                        "llama-server -m dolphin-3b-iq4_xs.gguf --port 8080 -c 4096 -t 4",
-                        style = MaterialTheme.typography.bodySmall
+                        command,
+                        style = MaterialTheme.typography.bodySmall,
+                        fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace
                     )
                     Spacer(Modifier.height(8.dp))
                     OutlinedButton(onClick = {
-                        clipboard.setText(AnnotatedString(
-                            "llama-server -m dolphin-3b-iq4_xs.gguf --port 8080 -c 4096 -t 4"
-                        ))
+                        clipboard.setText(AnnotatedString(command))
                     }) { Text("Copy command") }
                 }
             }
         }
     }
+}
+
+/**
+ * Builds the exact llama-server launch command for Termux, driven by the
+ * user's current Settings (server URL, model name, context size, threads)
+ * so the copy-paste block never drifts out of sync with what's configured
+ * in the app. Assumes the standard `~/llama.cpp` build layout and models
+ * kept under `~/models/` — adjust paths here if your Termux setup differs.
+ */
+private fun buildTermuxCommand(settings: LumosSettings): String {
+    val uri = runCatching { java.net.URI(settings.serverUrl) }.getOrNull()
+    val host = uri?.host ?: "127.0.0.1"
+    val port = uri?.port?.takeIf { it > 0 } ?: 8080
+    return "~/llama.cpp/build/bin/llama-server \\\n" +
+        "  -m ~/models/${settings.modelName} \\\n" +
+        "  --host $host \\\n" +
+        "  --port $port \\\n" +
+        "  -c ${settings.contextSize} \\\n" +
+        "  -t ${settings.cpuThreads}"
 }

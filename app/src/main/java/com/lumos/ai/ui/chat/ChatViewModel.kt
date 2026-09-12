@@ -1,6 +1,10 @@
 package com.lumos.ai.ui.chat
 
 import android.app.Application
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
@@ -13,6 +17,7 @@ import com.lumos.ai.data.db.LumosDatabase
 import com.lumos.ai.data.db.MessageEntity
 import com.lumos.ai.network.LlamaApiClient
 import com.lumos.ai.network.ServerManager
+import com.lumos.ai.service.GenerationService
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -50,8 +55,24 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private var serverJob: Job? = null
     private var observeJob: Job? = null
 
+    // Lets the "Stop" action in the generation notification cancel the
+    // in-flight stream even while the app itself is backgrounded.
+    private val stopReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) = stop()
+    }
+    private var stopReceiverRegistered = false
+
     init {
         startServerPolling()
+        val filter = IntentFilter(GenerationService.ACTION_STOP)
+        val ctx = getApplication<Application>()
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+            ctx.registerReceiver(stopReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            ctx.registerReceiver(stopReceiver, filter)
+        }
+        stopReceiverRegistered = true
     }
 
     fun loadConversation(id: Long) {
@@ -139,10 +160,19 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     fun stop() {
         currentCall?.cancel()
         currentCall = null
+        stopGenerationService()
         _ui.update { it.copy(generating = false) }
     }
 
+    fun deleteMessage(id: Long) {
+        viewModelScope.launch {
+            repo.deleteMessage(id)
+            _ui.update { s -> s.copy(messages = s.messages.filterNot { it.id == id }) }
+        }
+    }
+
     private suspend fun streamInto(convId: Long, assistantId: Long, settings: LumosSettings) {
+        startGenerationService()
         val history = repo.listMessages(convId)
         val buffer = StringBuilder()
 
@@ -156,14 +186,39 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             onDone = {
                 persistFinal(assistantId, buffer.toString())
                 currentCall = null
+                stopGenerationService()
             },
             onError = { err ->
                 persistFinal(assistantId, buffer.toString())
                 currentCall = null
+                stopGenerationService()
                 _ui.update { it.copy(generating = false, error = err) }
             }
         )
         // generating flag cleared in persistFinal / onError
+    }
+
+    /**
+     * Starts (or leaves running) the foreground service for the duration of a
+     * generation. Android's background execution limits can throttle or kill
+     * the streaming network callback once the app leaves the foreground;
+     * the service + its notification keeps the process alive and tells the
+     * user why. The service does no work itself — this ViewModel still owns
+     * the OkHttp call.
+     */
+    private fun startGenerationService() {
+        val ctx = getApplication<Application>()
+        val intent = Intent(ctx, GenerationService::class.java)
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+            ctx.startForegroundService(intent)
+        } else {
+            ctx.startService(intent)
+        }
+    }
+
+    private fun stopGenerationService() {
+        val ctx = getApplication<Application>()
+        ctx.stopService(Intent(ctx, GenerationService::class.java))
     }
 
     private fun updateMessageInState(id: Long, content: String) {
@@ -191,6 +246,10 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         currentCall?.cancel()
         serverJob?.cancel()
         observeJob?.cancel()
+        stopGenerationService()
+        if (stopReceiverRegistered) {
+            runCatching { getApplication<Application>().unregisterReceiver(stopReceiver) }
+        }
     }
 
     companion object {

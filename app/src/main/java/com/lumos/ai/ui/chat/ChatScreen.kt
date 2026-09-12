@@ -1,6 +1,8 @@
 package com.lumos.ai.ui.chat
 
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -26,6 +28,8 @@ import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -39,7 +43,11 @@ import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -55,8 +63,29 @@ fun ChatScreen(vm: ChatViewModel, onBack: () -> Unit, onOpenSettings: () -> Unit
     val state by vm.ui.collectAsState()
     val listState = rememberLazyListState()
 
+    // True only if the last message is currently the last *visible* item, i.e.
+    // the user hasn't scrolled away from the bottom. Read BEFORE we scroll so
+    // a manual scroll-up is respected and never yanked back.
+    val isAtBottom by remember {
+        derivedStateOf {
+            val lastVisible = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: -1
+            val lastIndex = state.messages.size - 1
+            lastIndex < 0 || lastVisible >= lastIndex
+        }
+    }
+
     LaunchedEffect(state.messages.size, state.messages.lastOrNull()?.content?.length) {
-        if (state.messages.isNotEmpty()) {
+        if (state.messages.isNotEmpty() && isAtBottom) {
+            // scrollToItem (not animateScrollToItem): per-token calls fire many times
+            // a second while streaming, and stacking animations on top of each other
+            // is what was blocking manual scroll gestures. A new message arriving
+            // (size change) still gets a smooth animated scroll below.
+            listState.scrollToItem(state.messages.size - 1)
+        }
+    }
+
+    LaunchedEffect(state.messages.size) {
+        if (state.messages.isNotEmpty() && isAtBottom) {
             listState.animateScrollToItem(state.messages.size - 1)
         }
     }
@@ -168,50 +197,84 @@ fun ChatScreen(vm: ChatViewModel, onBack: () -> Unit, onOpenSettings: () -> Unit
                     isLastAssistant = msg.role == "assistant" &&
                         state.messages.lastOrNull()?.id == msg.id &&
                         !state.generating && msg.content.isNotBlank(),
-                    onRegenerate = vm::regenerate
+                    onRegenerate = vm::regenerate,
+                    onDelete = vm::deleteMessage
                 )
             }
         }
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-fun MessageBubble(msg: MessageEntity, isLastAssistant: Boolean, onRegenerate: () -> Unit) {
+fun MessageBubble(
+    msg: MessageEntity,
+    isLastAssistant: Boolean,
+    onRegenerate: () -> Unit,
+    onDelete: (Long) -> Unit
+) {
     val clipboard = LocalClipboardManager.current
     val isUser = msg.role == "user"
+    var menuExpanded by remember { mutableStateOf(false) }
 
     Column(
         Modifier.fillMaxWidth(),
         horizontalAlignment = if (isUser) Alignment.End else Alignment.Start
     ) {
-        Card(
-            shape = RoundedCornerShape(
-                topStart = 18.dp, topEnd = 18.dp,
-                bottomStart = if (isUser) 18.dp else 4.dp,
-                bottomEnd = if (isUser) 4.dp else 18.dp
-            ),
-            colors = CardDefaults.cardColors(
-                containerColor = if (isUser) MaterialTheme.colorScheme.primary
-                else MaterialTheme.colorScheme.surfaceVariant
-            ),
-            modifier = Modifier.widthIn(max = 320.dp)
-        ) {
-            Column(Modifier.padding(12.dp)) {
-                if (msg.role == "assistant" && msg.content.isBlank()) {
-                    CircularProgressIndicator(
-                        Modifier
-                            .size(16.dp)
-                            .padding(top = 2.dp),
-                        strokeWidth = 2.dp
+        Box {
+            Card(
+                shape = RoundedCornerShape(
+                    topStart = 18.dp, topEnd = 18.dp,
+                    bottomStart = if (isUser) 18.dp else 4.dp,
+                    bottomEnd = if (isUser) 4.dp else 18.dp
+                ),
+                colors = CardDefaults.cardColors(
+                    containerColor = if (isUser) MaterialTheme.colorScheme.primary
+                    else MaterialTheme.colorScheme.surfaceVariant
+                ),
+                modifier = Modifier
+                    .widthIn(max = 320.dp)
+                    // Long-press any message (user or assistant) for a quick
+                    // Copy / Delete menu. Regenerate stays as the dedicated
+                    // button below the last assistant reply.
+                    .combinedClickable(
+                        onClick = {},
+                        onLongClick = { menuExpanded = true }
                     )
-                } else {
-                    Text(
-                        msg.content,
-                        color = if (isUser) MaterialTheme.colorScheme.onPrimary
-                        else MaterialTheme.colorScheme.onSurface,
-                        style = MaterialTheme.typography.bodyLarge
-                    )
+            ) {
+                Column(Modifier.padding(12.dp)) {
+                    if (msg.role == "assistant" && msg.content.isBlank()) {
+                        CircularProgressIndicator(
+                            Modifier
+                                .size(16.dp)
+                                .padding(top = 2.dp),
+                            strokeWidth = 2.dp
+                        )
+                    } else {
+                        Text(
+                            msg.content,
+                            color = if (isUser) MaterialTheme.colorScheme.onPrimary
+                            else MaterialTheme.colorScheme.onSurface,
+                            style = MaterialTheme.typography.bodyLarge
+                        )
+                    }
                 }
+            }
+            DropdownMenu(expanded = menuExpanded, onDismissRequest = { menuExpanded = false }) {
+                DropdownMenuItem(
+                    text = { Text("Copy") },
+                    onClick = {
+                        clipboard.setText(AnnotatedString(msg.content))
+                        menuExpanded = false
+                    }
+                )
+                DropdownMenuItem(
+                    text = { Text("Delete") },
+                    onClick = {
+                        onDelete(msg.id)
+                        menuExpanded = false
+                    }
+                )
             }
         }
         if (isLastAssistant) {

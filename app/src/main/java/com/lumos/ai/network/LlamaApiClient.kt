@@ -108,11 +108,15 @@ class LlamaApiClient {
                         val payload = l.removePrefix("data:").trim()
                         if (payload == "[DONE]") break
                         try {
+                            // NOTE: optString(name) with no fallback returns the literal
+                            // string "null" when the key is absent (org.json quirk), not
+                            // Kotlin null. The first SSE chunk is role-only with no
+                            // "content" key, so always pass a "" fallback here.
                             val delta = JSONObject(payload)
                                 .optJSONArray("choices")
                                 ?.optJSONObject(0)
                                 ?.optJSONObject("delta")
-                                ?.optString("content")
+                                ?.optString("content", "")
                             if (!delta.isNullOrEmpty()) onToken(delta)
                         } catch (je: Exception) {
                             // skip malformed keep-alive chunks
